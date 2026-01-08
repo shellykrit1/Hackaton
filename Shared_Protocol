@@ -1,0 +1,236 @@
+# shared_protocol.py
+# shared protocol definitions used by both the client and the server.
+# contains protocol constants, binary packet packing/unpacking and helper functions for fixed length names and Blackjack card handling.
+
+from __future__ import annotations
+from dataclasses import dataclass
+import struct
+
+# packet formats
+magic_cookie = 0xabcddcba
+message_type_offer = 0x2
+message_type_request = 0x3
+message_type_payload = 0x4
+client_udp_offer_port = 13122
+round_not_over = 0x0
+round_result_tie = 0x1
+round_result_loss = 0x2
+round_result_win = 0x3
+suit_encoded_hearts = 0
+suit_encoded_diamonds = 1
+suit_encoded_clubs = 2
+suit_encoded_spades = 3
+suit_encoded_to_char = {
+    suit_encoded_hearts: "H",
+    suit_encoded_diamonds: "D",
+    suit_encoded_clubs: "C",
+    suit_encoded_spades: "S"
+}
+rank_encoded_to_str = {1: "A", 11: "J", 12: "Q", 13: "K"}
+
+
+# fixed length name helper functions
+
+def fixed_length_name(name: str) -> bytes:
+    """
+    convert a string into a fixed length 32 byte.
+    This is for team/server names.
+    """
+    new_name = name.encode("utf-8", errors="ignore")
+    new_name = new_name[:32]
+    return new_name.ljust(32, b"\x00")
+
+
+def parse_fixed_32_name(name: bytes) -> str:
+    """
+    convert a fixed length 32 byte into a Python string.
+    """
+    return name.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")
+
+
+# offer message (UDP broadcast)
+# format: cookie(4) + type(1) + tcp_port(2) + server_name(32)
+
+@dataclass(frozen=True)  # meaning can't change after creation
+class Offer:
+    port_tcp: int
+    name_server: str
+
+
+def offer_pack(offer: Offer) -> bytes:
+    """
+    pack an Offer using network byte order.
+    struct: ! I B H 32s
+    """
+    return struct.pack(
+        "!IBH32s",
+        magic_cookie,
+        message_type_offer,
+        offer.port_tcp,
+        fixed_length_name(offer.name_server),
+    )
+
+
+def offer_unpack(packet_info: bytes) -> Offer | None:
+    """
+    unpack an Offer message.
+    return Offer if valid, else None (ignore invalid packets).
+    validation of total length, cookie and message type
+    """
+    packet_expected_length = struct.calcsize("!IBH32s")
+    if len(packet_info) != packet_expected_length:  # if length doesn't match
+        return None
+
+    cookie, message_type, port_tcp, name32 = struct.unpack("!IBH32s", packet_info)
+    if cookie != magic_cookie or message_type != message_type_offer:  # if cookie or message type doesn't match
+        return None
+
+    return Offer(port_tcp=port_tcp, name_server=parse_fixed_32_name(name32))   # return offer
+
+
+# request message (TCP)
+# format: cookie(4) + type(1) + rounds(1) + team_name(32)
+
+@dataclass(frozen=True)  # meaning can't change after creation
+class Request:
+    number_of_rounds: int
+    name_team: str
+
+
+def request_pack(request: Request) -> bytes:
+    """
+    pack a Request message.
+    Struct: ! I B B 32s
+        # I   - 4-byte unsigned integer (magic number)
+    # B   - 1-byte unsigned value (protocol version)
+    # B   - 1-byte unsigned value (number of rounds)
+    # 32s - fixed-length 32-byte string (team/server name)
+    """
+    number_of_rounds_1b = int(request.number_of_rounds) & 0xFF
+    return struct.pack(
+        "!IBB32s",
+        magic_cookie,
+        message_type_request,
+        number_of_rounds_1b,
+        fixed_length_name(request.name_team),
+    )
+
+
+def request_unpack(packet_info: bytes) -> Request | None:
+    """
+    unpack a Request message.
+    return None if invalid length, cookie or type.
+    """
+    packet_expected_length = struct.calcsize("!IBB32s")
+    if len(packet_info) != packet_expected_length:  # if length doesn't match
+        return None
+
+    cookie, message_type, rounds_1b, name32 = struct.unpack("!IBB32s", packet_info)
+    if cookie != magic_cookie or message_type != message_type_request:   # if cookie or message type doesn't match
+        return None
+
+    return Request(number_of_rounds=int(rounds_1b), name_team=parse_fixed_32_name(name32))  # return request
+
+
+# Payload messages (TCP)
+# client->server decision payload format:
+# cookie(4) + type(1) + decision(5) ("Hittt" or "Stand")
+# server->client payload format:
+# cookie(4) + type(1) + result(1) + rank(2) + suit(1)
+
+@dataclass(frozen=True)  # meaning can't change after creation
+class ServerPayload:
+    """
+    server->client payload data:
+    - result: 1 byte
+    - rank  : 2 bytes
+    - suit  : 1 byte
+    """
+    round_result: int
+    card_rank: int
+    card_suit: int
+
+
+def server_payload_pack(server_payload: ServerPayload) -> bytes:
+    """
+    pack the server payload message.
+    Struct: ! I B B H B
+    """
+    return struct.pack(
+        "!IBBHB",
+        magic_cookie,
+        message_type_payload,
+        int(server_payload.round_result) & 0xFF,
+        int(server_payload.card_rank) & 0xFFFF,
+        int(server_payload.card_suit) & 0xFF,
+    )
+
+
+def server_payload_unpack(packet_info: bytes) -> ServerPayload | None:
+    """
+    unpack a server payload message.
+    return None if invalid length, cookie or type.
+    """
+    packet_expected_length = struct.calcsize("!IBBHB")
+    if len(packet_info) != packet_expected_length:  # if length doesn't match
+        return None
+
+    cookie, message_type, result, rank, suit = struct.unpack("!IBBHB", packet_info)
+    if cookie != magic_cookie or message_type != message_type_payload:  # if cookie or message type doesn't match
+        return None
+
+    return ServerPayload(round_result=result, card_rank=rank, card_suit=suit)  # return ServerPayload
+
+
+def client_answer_pack(answer: str) -> bytes:
+    """
+    pack a client answer payload.
+    Struct: ! I B 5s
+    client answer needs to be "Hittt" or "Stand".
+    """
+    if answer not in ("Hittt", "Stand"):  # if invalid input
+        raise ValueError("decision must be exactly 'Hittt' or 'Stand'")
+    return struct.pack("!IB5s", magic_cookie, message_type_payload, answer.encode("ascii"))
+
+
+def client_answer_unpack(answer: bytes) -> str | None:
+    """
+    unpack a client answer payload.
+    return 'Hittt'/'Stand' or None if invalid.
+    """
+    packet_expected_length = struct.calcsize("!IB5s")
+    if len(answer) != packet_expected_length:  # if length doesn't match
+        return None
+
+    cookie, message_type, decode5bits = struct.unpack("!IB5s", answer)
+    if cookie != magic_cookie or message_type != message_type_payload:  # if cookie or message type doesn't match
+        return None
+
+    try:
+        string_answer_text = decode5bits.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+    return string_answer_text if string_answer_text in ("Hittt", "Stand") else None  # return string text
+
+
+# Blackjack helper functions
+
+def rank_to_game_value(card_rank: int) -> int:
+    """
+    convert rank into blackjack score value according to the assignment (Ace - 11, J/Q/K - 10, others are their numeric values).
+    """
+    # if card_rank == 1:
+    #     return 11
+    if card_rank in (11, 12, 13):
+        return 10
+    return card_rank
+
+
+def card_to_str(card_rank: int, card_suit: int) -> str:
+    """
+    produce a compact string representation for logging.
+    """
+    rank = rank_encoded_to_str.get(card_rank, str(card_rank))
+    suit = suit_encoded_to_char.get(card_suit, "?")
+    return f"{rank}{suit}"
