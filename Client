@@ -1,0 +1,356 @@
+# client.py
+
+from __future__ import annotations
+import socket
+from typing import Tuple, Optional
+
+from shared_protocol import (
+    client_udp_offer_port,
+    offer_unpack,
+    request_pack,
+    Request,
+    server_payload_unpack,
+    client_answer_pack,
+    round_not_over,
+    round_result_win,
+    round_result_loss,
+    round_result_tie,
+    card_to_str,
+    rank_to_game_value,
+)
+
+# TCP connect timeout
+connect_timeout_seconds = 5.0
+debug = True
+
+
+def check_length_packet(conn: socket.socket, length: int) -> Optional[bytes]:
+    """
+    Read exactly n bytes from a TCP stream (because TCP is a byte stream, not message-based).
+    Returns None if the server closed the connection or an OS error occurred.
+    """
+    packet_info = b""
+    while len(packet_info) < length:  # loop until packet size not smaller than "length"
+        try:
+            left_bytes = conn.recv(length - len(packet_info))  # read remaining bytes
+        except OSError:
+            return None  # return None
+        if not left_bytes:
+            return None  # return None
+        packet_info += left_bytes
+    return packet_info  # return packet_info
+
+
+def input_num_rounds() -> int:
+    """
+    ask user for the number of rounds (0-255) until valid input is given
+    """
+    while True:
+        number_of_rounds = input("Enter number of rounds to play (0-255): ").strip()
+        try:
+            value = int(number_of_rounds)
+        except ValueError:
+            print("Invalid input. Please enter an integer between 0 and 255.")
+            continue
+        if value < 0 or value > 255:
+            print("Invalid range. Please enter an integer between 0 and 255.")
+        return value
+
+
+def input_move() -> str:
+    """
+    ask user for a move: 'h' for hit or 's' for stand until valid input is given.
+    """
+    while True:
+        move = input("Your move (h=hit, s=stand): ").strip().lower()
+        if move in ("h", "s"):
+            return move
+        print("Invalid input. Please type 'h' for hit or 's' for stand.")
+
+
+def listen_for_offer() -> Tuple[str, int, str]:
+    """
+    listen for UDP broadcast offers on a known UDP port.
+    this uses blocking recvfrom() - not busy-waiting.
+    """
+    # UDP socket for receiving offers
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    # allow multiple clients to bind the same UDP port
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    # bind to the chosen offer port
+    sock.bind(("", client_udp_offer_port))
+    print("Client started, listening for offer requests...")
+
+    while True:
+        # wait for UDP packet
+        data, (src_ip, src_port) = sock.recvfrom(1024)
+        # parse Offer packet according to protocol
+        offer = offer_unpack(data)
+        if offer is None:
+            continue
+        # validate TCP port in offer
+        port_tcp = int(offer.port_tcp)
+        if not (1 <= port_tcp <= 65535):
+            continue
+        # parse server name from offer
+        name_server = offer.name_server
+        # close UDP socket after choosing a server
+        sock.close()
+        print(f"Received offer from {src_ip}")
+        return src_ip, port_tcp, name_server
+
+
+class ClientStats:
+    """
+    collect interesting statistics for one session.
+    """
+    def __init__(self) -> None:
+        # overall results counters
+        self.total_rounds = 0
+        self.total_wins = 0
+        self.total_losses = 0
+        self.total_ties = 0
+        self.total_player_busts = 0
+        self.total_hits = 0
+        self.sum_cards_received: list[int] = []
+        self.num_cards_received: list[int] = []
+
+    def update_counters_round(self, result: int, player_cards_received: int, busted: bool, hits: int, cards_received: int) -> None:
+        """
+        update internal counters for the end of a round.
+        """
+        self.total_rounds += 1
+        self.total_hits += hits
+        self.sum_cards_received.append(player_cards_received)
+        self.num_cards_received.append(cards_received)
+
+        if busted:
+            self.total_player_busts += 1
+        if result == round_result_win:
+            self.total_wins += 1
+        elif result == round_result_loss:
+            self.total_losses += 1
+        else:
+            self.total_ties += 1
+
+    def summery_round_print(self) -> None:
+        """
+        print a summary after the session ends.
+        """
+        total_number_rounds = self.total_rounds
+        win_rate = (self.total_wins / total_number_rounds) if total_number_rounds > 0 else 0.0
+        print(f"Finished playing {total_number_rounds} rounds, win rate: {win_rate}")
+
+        if total_number_rounds == 0:
+            return
+
+        bust_rate = self.total_player_busts / total_number_rounds
+        avg_sum_cards = sum(self.sum_cards_received) / total_number_rounds
+        avg_num_cards = sum(self.num_cards_received) / total_number_rounds
+
+        print(f"Statistics: wins={self.total_wins}, losses={self.total_losses}, ties={self.total_ties}")
+        print(f"Statistics: player_busts = {self.total_player_busts} ({bust_rate:.2%})")
+        print(f"Statistics: avg_player_final_total = {avg_sum_cards:.2f}")
+        print(f"Statistics: avg_cards_received_per_round = {avg_num_cards:.2f}")
+
+
+def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -> ClientStats:
+    """
+    connect to the server over TCP and play "rounds" number of rounds.
+    returns a ClientStats object with aggregated statistics for the session.
+    """
+    # create a statistics collector for the whole session
+    statistics = ClientStats()
+    # create a TCP socket and connect to the server
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    conn.settimeout(connect_timeout_seconds)  # prevent connect() from blocking forever
+    conn.connect((server_ip, server_port))  # connect to server's TCP endpoint
+    conn.settimeout(None)  # back to blocking mode for gameplay
+    # send the initial Request packet
+    conn.sendall(request_pack(Request(number_of_rounds=rounds, name_team=name_team)))
+    # play the requested number of rounds
+    for round_index in range(1, rounds + 1):
+        print(f"\n--- Round {round_index}/{rounds} ---")
+        # per round counters
+        num_cards = 0
+        num_hits = 0
+        sum_cards = 0
+
+        # the client reads 3 server payloads at the beginning of the round.
+        for i in range(3):
+            message = check_length_packet(conn, 9)  # check packet length
+            if message is None:
+                conn.close()
+                raise RuntimeError("Connection closed while receiving initial cards")
+
+            server_payload = server_payload_unpack(message)  # parse the server payload
+            # validate protocol - round not finished yet + a real card
+            # if server_payload is None or server_payload.round_result != round_not_over or server_payload.card_rank == 0:
+            if server_payload is None or server_payload.round_result != round_not_over:
+                conn.close()
+                raise RuntimeError("Protocol error: invalid initial payload")
+
+            card_value = rank_to_game_value(server_payload.card_rank)
+            if i < 2:
+                print(f"Player card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+            else:
+                print(f"Dealer up-card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+            # first two cards are player's, third is dealer's up-card
+            if i < 2:
+                sum_cards += card_value
+                num_cards += 1
+
+        round_result: Optional[int] = None
+        busted = False
+
+        # player phase - keep asking for HIT/Stand until the round ends or player stands
+        while True:
+            move = input_move()
+            if move == "h":
+                num_hits += 1
+                conn.sendall(client_answer_pack("Hittt"))  # send HIT decision to server
+                message = check_length_packet(conn, 9)  # check packet length
+                if message is None:
+                    conn.close()
+                    raise RuntimeError("Connection closed after HIT")
+                server_payload = server_payload_unpack(message)  # parse the server payload
+                if server_payload is None:
+                    conn.close()
+                    raise RuntimeError("Protocol error after HIT")
+
+                # normal HIT response - server sends another card if round not finished yet + a real card
+                if server_payload.round_result == round_not_over and server_payload.card_rank != 0:
+                    card_value = rank_to_game_value(server_payload.card_rank)
+                    sum_cards += card_value
+                    num_cards += 1
+                    print(f"Player card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+                    if sum_cards > 21:
+                        loss_message = check_length_packet(conn, 9)  # check packet length
+                        if loss_message is None:
+                            conn.close()
+                            raise RuntimeError("Connection closed while waiting for bust result")
+
+                        server_payload_loss = server_payload_unpack(loss_message)  # parse the server payload
+                        if server_payload_loss is None or server_payload_loss.round_result != round_result_loss:
+                            conn.close()
+                            raise RuntimeError("Protocol error: expected LOSS after bust")
+                        print("Round result: LOSS")
+                        round_result = round_result_loss
+                        busted = True  # player busts
+                        break
+                    # player haven't busted, continue player decisions
+                    continue
+
+                # print round result
+                if server_payload.round_result in (round_result_win, round_result_loss, round_result_tie):
+                    if server_payload.round_result == round_result_win:
+                        print("Round result: WIN")
+                    elif server_payload.round_result == round_result_loss:
+                        print("Round result: LOSS")
+                    else:
+                        print("Round result: TIE")
+                    round_result = server_payload.round_result
+                    break
+
+                conn.close()
+                raise RuntimeError("Protocol error: unexpected payload after HIT")
+
+            else:
+                # stand - send decision and proceed to dealer phase
+                conn.sendall(client_answer_pack("Stand"))
+                if debug:
+                    print("Stand sent, waiting for dealer phase...")
+                break
+
+        # if the round already ended in player phase (bust or 2 Aces in the first round)
+        if round_result is not None:
+            statistics.update_counters_round(
+                result=round_result,
+                player_cards_received=sum_cards,
+                busted=busted,
+                hits=num_hits,
+                cards_received=num_cards,
+            )
+            continue
+
+        # dealer phase - receive server payloads until dealer's done by the rules
+        while True:
+            message = check_length_packet(conn, 9)  # check packet length
+            if message is None:
+                conn.close()
+                raise RuntimeError("Connection closed during dealer phase")
+
+            server_payload = server_payload_unpack(message)  # parse the server payload
+            if server_payload is None:
+                conn.close()
+                raise RuntimeError("Protocol error during dealer phase")
+
+            # print round result
+            if server_payload.round_result in (round_result_win, round_result_loss, round_result_tie):
+                if server_payload.round_result == round_result_win:
+                    print("Round result: WIN")
+                elif server_payload.round_result == round_result_loss:
+                    print("Round result: LOSS")
+                else:
+                    print("Round result: TIE")
+                round_result = server_payload.round_result
+                break
+
+            # dealer card payload if round not over and a real card
+            if server_payload.round_result == round_not_over and server_payload.card_rank != 0:
+                card_value = rank_to_game_value(server_payload.card_rank)
+                print(f"Dealer card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+                continue
+
+            conn.close()
+            raise RuntimeError("Protocol error: unexpected payload during dealer phase")
+
+        # update session statistics after round is over
+        statistics.update_counters_round(
+            result=round_result if round_result is not None else round_result_loss,
+            player_cards_received=sum_cards,
+            busted=False,
+            hits=num_hits,
+            cards_received=num_cards,
+        )
+
+    # close TCP connection after all rounds
+    conn.close()
+    return statistics
+
+
+def main() -> None:
+    name_team = "ShellyOhadTeam"
+
+    while True:
+        try:
+            server_ip, server_port, name_server = listen_for_offer()
+            rounds = input_num_rounds()
+            statistics = play_rounds(server_ip, server_port, name_team, rounds)
+            statistics.summery_round_print()
+
+        except KeyboardInterrupt:
+            if debug:
+                print("\nInterrupted by user. Returning to listening...\n")
+            else:
+                print("\nReturning to listening...\n")
+            continue
+
+        except (socket.timeout, OSError):
+            print("Connection failed. Returning to listening...\n")
+            continue
+
+        except Exception as e:
+            if debug:
+                print(f"Error occurred: {e}. Returning to listening...\n")
+            else:
+                print("Error occurred. Returning to listening...\n")
+            continue
+
+
+if __name__ == "__main__":
+    main()
