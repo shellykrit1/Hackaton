@@ -1,4 +1,4 @@
-Hackaton - Network Blackjack
+# Hackaton - Network Blackjack
 
 This project is a simple multiplayer Blackjack game built using a client–server architecture. It was created as part of a hackathon to demonstrate basic networking concepts and protocol design.
 The server broadcasts its availability using UDP, allowing clients to automatically discover it without manual configuration. Once a client selects a server, the game communication is handled over a TCP connection.
