@@ -2,9 +2,9 @@
 # shared protocol definitions used by both the client and the server.
 # contains protocol constants, binary packet packing/unpacking and helper functions for fixed length names and Blackjack card handling.
 
-from __future__ import annotations
 from dataclasses import dataclass
 import struct
+import socket
 
 # packet formats
 magic_cookie = 0xabcddcba
@@ -27,6 +27,36 @@ suit_encoded_to_char = {
     suit_encoded_spades: "S"
 }
 rank_encoded_to_str = {1: "A", 11: "J", 12: "Q", 13: "K"}
+
+
+# print round result helper
+def round_result_to_str(result: int) -> str:
+    if result == round_result_win:
+        return "WIN"
+    if result == round_result_loss:
+        return "LOSS"
+    if result == round_result_tie:
+        return "TIE"
+    if result == round_not_over:
+        return "NOT_OVER"
+    return f"UNKNOWN({result})"
+
+
+def receive_length_packet(conn: socket.socket, length: int) -> bytes:
+    """
+        receive exactly n bytes from a TCP socket.
+        returns None if the connection is closed or an error occurs.
+        """
+    packet_info = b""
+    while len(packet_info) < length:  # loop until packet size not smaller than "length"
+        try:
+            left_bytes = conn.recv(length - len(packet_info))  # read remaining bytes
+        except OSError:
+            return None  # return None
+        if not left_bytes:
+            return None  # return None
+        packet_info += left_bytes
+    return packet_info  # return packet_info
 
 
 # fixed length name helper functions
@@ -61,6 +91,10 @@ def offer_pack(offer: Offer) -> bytes:
     """
     pack an Offer using network byte order.
     struct: ! I B H 32s
+    # I   - 4-byte unsigned integer (magic number)
+    # B   - 1-byte unsigned value (protocol version)
+    # H   - 2-byte unsigned short (TCP port)
+    # 32s - fixed-length 32-byte string (team/server name)
     """
     return struct.pack(
         "!IBH32s",
@@ -85,7 +119,7 @@ def offer_unpack(packet_info: bytes) -> Offer | None:
     if cookie != magic_cookie or message_type != message_type_offer:  # if cookie or message type doesn't match
         return None
 
-    return Offer(port_tcp=port_tcp, name_server=parse_fixed_32_name(name32))   # return offer
+    return Offer(port_tcp=port_tcp, name_server=parse_fixed_32_name(name32))  # return offer
 
 
 # request message (TCP)
@@ -102,9 +136,9 @@ def request_pack(request: Request) -> bytes:
     pack a Request message.
     Struct: ! I B B 32s
         # I   - 4-byte unsigned integer (magic number)
-    # B   - 1-byte unsigned value (protocol version)
-    # B   - 1-byte unsigned value (number of rounds)
-    # 32s - fixed-length 32-byte string (team/server name)
+        # B   - 1-byte unsigned value (protocol version)
+        # B   - 1-byte unsigned value (number of rounds)
+        # 32s - fixed-length 32-byte string (team/server name)
     """
     number_of_rounds_1b = int(request.number_of_rounds) & 0xFF
     return struct.pack(
@@ -126,7 +160,7 @@ def request_unpack(packet_info: bytes) -> Request | None:
         return None
 
     cookie, message_type, rounds_1b, name32 = struct.unpack("!IBB32s", packet_info)
-    if cookie != magic_cookie or message_type != message_type_request:   # if cookie or message type doesn't match
+    if cookie != magic_cookie or message_type != message_type_request:  # if cookie or message type doesn't match
         return None
 
     return Request(number_of_rounds=int(rounds_1b), name_team=parse_fixed_32_name(name32))  # return request
@@ -155,6 +189,11 @@ def server_payload_pack(server_payload: ServerPayload) -> bytes:
     """
     pack the server payload message.
     Struct: ! I B B H B
+    # I   - 4-byte unsigned integer (magic cookie)
+    # B   - 1-byte unsigned value (message type)
+    # B   - 1-byte unsigned value (round result)
+    # H   - 2-byte unsigned short (card rank)
+    # B   - 1-byte unsigned value (card suit)
     """
     return struct.pack(
         "!IBBHB",
@@ -182,10 +221,13 @@ def server_payload_unpack(packet_info: bytes) -> ServerPayload | None:
     return ServerPayload(round_result=result, card_rank=rank, card_suit=suit)  # return ServerPayload
 
 
-def client_answer_pack(answer: str) -> bytes:
+def client_payload_pack(answer: str) -> bytes:
     """
     pack a client answer payload.
     Struct: ! I B 5s
+    # I   - 4-byte unsigned integer (magic cookie)
+    # B   - 1-byte unsigned value (message type)
+    # 5s  - fixed-length 5-byte ASCII string ("Hittt" or "Stand")
     client answer needs to be "Hittt" or "Stand".
     """
     if answer not in ("Hittt", "Stand"):  # if invalid input
@@ -193,7 +235,7 @@ def client_answer_pack(answer: str) -> bytes:
     return struct.pack("!IB5s", magic_cookie, message_type_payload, answer.encode("ascii"))
 
 
-def client_answer_unpack(answer: bytes) -> str | None:
+def client_payload_unpack(answer: bytes) -> str | None:
     """
     unpack a client answer payload.
     return 'Hittt'/'Stand' or None if invalid.
@@ -218,10 +260,8 @@ def client_answer_unpack(answer: bytes) -> str | None:
 
 def rank_to_game_value(card_rank: int) -> int:
     """
-    convert rank into blackjack score value according to the assignment (Ace - 11, J/Q/K - 10, others are their numeric values).
+    convert rank into blackjack score value according to the assignment (J/Q/K - 10, others are their numeric values).
     """
-    # if card_rank == 1:
-    #     return 11
     if card_rank in (11, 12, 13):
         return 10
     return card_rank
