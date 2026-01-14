@@ -1,8 +1,7 @@
 # client.py
 
-from __future__ import annotations
 import socket
-from typing import Tuple, Optional
+from typing import Tuple
 
 from shared_protocol import (
     client_udp_offer_port,
@@ -10,35 +9,19 @@ from shared_protocol import (
     request_pack,
     Request,
     server_payload_unpack,
-    client_answer_pack,
+    client_payload_pack,
     round_not_over,
     round_result_win,
     round_result_loss,
     round_result_tie,
     card_to_str,
     rank_to_game_value,
+    round_result_to_str,
+    receive_length_packet
 )
 
 # TCP connect timeout
 connect_timeout_seconds = 5.0
-debug = True
-
-
-def check_length_packet(conn: socket.socket, length: int) -> Optional[bytes]:
-    """
-    Read exactly n bytes from a TCP stream (because TCP is a byte stream, not message-based).
-    Returns None if the server closed the connection or an OS error occurred.
-    """
-    packet_info = b""
-    while len(packet_info) < length:  # loop until packet size not smaller than "length"
-        try:
-            left_bytes = conn.recv(length - len(packet_info))  # read remaining bytes
-        except OSError:
-            return None  # return None
-        if not left_bytes:
-            return None  # return None
-        packet_info += left_bytes
-    return packet_info  # return packet_info
 
 
 def input_num_rounds() -> int:
@@ -54,6 +37,7 @@ def input_num_rounds() -> int:
             continue
         if value < 0 or value > 255:
             print("Invalid range. Please enter an integer between 0 and 255.")
+            continue
         return value
 
 
@@ -77,10 +61,6 @@ def listen_for_offer() -> Tuple[str, int, str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     # allow multiple clients to bind the same UDP port
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except (AttributeError, OSError):
-        pass
     # bind to the chosen offer port
     sock.bind(("", client_udp_offer_port))
     print("Client started, listening for offer requests...")
@@ -108,6 +88,7 @@ class ClientStats:
     """
     collect interesting statistics for one session.
     """
+
     def __init__(self) -> None:
         # overall results counters
         self.total_rounds = 0
@@ -119,7 +100,8 @@ class ClientStats:
         self.sum_cards_received: list[int] = []
         self.num_cards_received: list[int] = []
 
-    def update_counters_round(self, result: int, player_cards_received: int, busted: bool, hits: int, cards_received: int) -> None:
+    def update_counters_round(self, result: int, player_cards_received: int, busted: bool, hits: int,
+                              cards_received: int) -> None:
         """
         update internal counters for the end of a round.
         """
@@ -152,10 +134,14 @@ class ClientStats:
         avg_sum_cards = sum(self.sum_cards_received) / total_number_rounds
         avg_num_cards = sum(self.num_cards_received) / total_number_rounds
 
-        print(f"Statistics: wins={self.total_wins}, losses={self.total_losses}, ties={self.total_ties}")
-        print(f"Statistics: player_busts = {self.total_player_busts} ({bust_rate:.2%})")
-        print(f"Statistics: avg_player_final_total = {avg_sum_cards:.2f}")
-        print(f"Statistics: avg_cards_received_per_round = {avg_num_cards:.2f}")
+        # print(f"Statistics: \n)
+        print(
+            f"Statistics:\n"
+            f"Wins={self.total_wins}, Losses={self.total_losses}, Ties={self.total_ties}\n"
+            f"Number of player busts={self.total_player_busts} ({bust_rate:.2%})\n"
+            f"Average player total amount cards={avg_sum_cards:.2f}\n"
+            f"Average number of player's cards received per round={avg_num_cards:.2f}"
+        )
 
 
 def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -> ClientStats:
@@ -178,33 +164,37 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
         # per round counters
         num_cards = 0
         num_hits = 0
-        sum_cards = 0
+        player_sum = 0
+        dealer_sum = 0
 
         # the client reads 3 server payloads at the beginning of the round.
         for i in range(3):
-            message = check_length_packet(conn, 9)  # check packet length
+            message = receive_length_packet(conn, 9)
             if message is None:
                 conn.close()
                 raise RuntimeError("Connection closed while receiving initial cards")
 
             server_payload = server_payload_unpack(message)  # parse the server payload
             # validate protocol - round not finished yet + a real card
-            # if server_payload is None or server_payload.round_result != round_not_over or server_payload.card_rank == 0:
-            if server_payload is None or server_payload.round_result != round_not_over:
+            if server_payload is None or server_payload.round_result != round_not_over or server_payload.card_rank == 0:
                 conn.close()
                 raise RuntimeError("Protocol error: invalid initial payload")
 
             card_value = rank_to_game_value(server_payload.card_rank)
             if i < 2:
-                print(f"Player card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+                print(
+                    f"Player card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
             else:
-                print(f"Dealer up-card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+                print(
+                    f"Dealer up card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
+                dealer_sum += card_value
             # first two cards are player's, third is dealer's up-card
             if i < 2:
-                sum_cards += card_value
+                player_sum += card_value
                 num_cards += 1
+                print(f"Player sum cards: {player_sum}")
 
-        round_result: Optional[int] = None
+        round_result = None
         busted = False
 
         # player phase - keep asking for HIT/Stand until the round ends or player stands
@@ -212,8 +202,8 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
             move = input_move()
             if move == "h":
                 num_hits += 1
-                conn.sendall(client_answer_pack("Hittt"))  # send HIT decision to server
-                message = check_length_packet(conn, 9)  # check packet length
+                conn.sendall(client_payload_pack("Hittt"))  # send HIT decision to server
+                message = receive_length_packet(conn, 9)
                 if message is None:
                     conn.close()
                     raise RuntimeError("Connection closed after HIT")
@@ -225,11 +215,12 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
                 # normal HIT response - server sends another card if round not finished yet + a real card
                 if server_payload.round_result == round_not_over and server_payload.card_rank != 0:
                     card_value = rank_to_game_value(server_payload.card_rank)
-                    sum_cards += card_value
+                    player_sum += card_value
                     num_cards += 1
                     print(f"Player card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
-                    if sum_cards > 21:
-                        loss_message = check_length_packet(conn, 9)  # check packet length
+                    print(f"Player sum cards: {player_sum}")
+                    if player_sum > 21:
+                        loss_message = receive_length_packet(conn, 9)
                         if loss_message is None:
                             conn.close()
                             raise RuntimeError("Connection closed while waiting for bust result")
@@ -242,35 +233,25 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
                         round_result = round_result_loss
                         busted = True  # player busts
                         break
+
                     # player haven't busted, continue player decisions
                     continue
-
-                # print round result
-                if server_payload.round_result in (round_result_win, round_result_loss, round_result_tie):
-                    if server_payload.round_result == round_result_win:
-                        print("Round result: WIN")
-                    elif server_payload.round_result == round_result_loss:
-                        print("Round result: LOSS")
-                    else:
-                        print("Round result: TIE")
-                    round_result = server_payload.round_result
-                    break
 
                 conn.close()
                 raise RuntimeError("Protocol error: unexpected payload after HIT")
 
             else:
                 # stand - send decision and proceed to dealer phase
-                conn.sendall(client_answer_pack("Stand"))
-                if debug:
-                    print("Stand sent, waiting for dealer phase...")
+                conn.sendall(client_payload_pack("Stand"))
+                print("Stand sent, waiting for dealer phase...")
                 break
 
-        # if the round already ended in player phase (bust or 2 Aces in the first round)
+        # if the round already ended in player phase (bust)
         if round_result is not None:
+            print(f"Round summary: player sum cards={player_sum}, dealer sum cards={dealer_sum}")
             statistics.update_counters_round(
                 result=round_result,
-                player_cards_received=sum_cards,
+                player_cards_received=player_sum,
                 busted=busted,
                 hits=num_hits,
                 cards_received=num_cards,
@@ -279,7 +260,7 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
 
         # dealer phase - receive server payloads until dealer's done by the rules
         while True:
-            message = check_length_packet(conn, 9)  # check packet length
+            message = receive_length_packet(conn, 9)
             if message is None:
                 conn.close()
                 raise RuntimeError("Connection closed during dealer phase")
@@ -291,28 +272,25 @@ def play_rounds(server_ip: str, server_port: int, name_team: str, rounds: int) -
 
             # print round result
             if server_payload.round_result in (round_result_win, round_result_loss, round_result_tie):
-                if server_payload.round_result == round_result_win:
-                    print("Round result: WIN")
-                elif server_payload.round_result == round_result_loss:
-                    print("Round result: LOSS")
-                else:
-                    print("Round result: TIE")
+                print(f"Round result: {round_result_to_str(server_payload.round_result)}")
                 round_result = server_payload.round_result
                 break
 
             # dealer card payload if round not over and a real card
             if server_payload.round_result == round_not_over and server_payload.card_rank != 0:
                 card_value = rank_to_game_value(server_payload.card_rank)
+                dealer_sum += card_value
                 print(f"Dealer card received: {card_to_str(server_payload.card_rank, server_payload.card_suit)} (value={card_value})")
                 continue
 
             conn.close()
             raise RuntimeError("Protocol error: unexpected payload during dealer phase")
 
+        print(f"Round summary: player sum cards={player_sum}, dealer sum cards={dealer_sum}")
         # update session statistics after round is over
         statistics.update_counters_round(
             result=round_result if round_result is not None else round_result_loss,
-            player_cards_received=sum_cards,
+            player_cards_received=player_sum,
             busted=False,
             hits=num_hits,
             cards_received=num_cards,
@@ -328,16 +306,13 @@ def main() -> None:
 
     while True:
         try:
-            server_ip, server_port, name_server = listen_for_offer()
             rounds = input_num_rounds()
+            server_ip, server_port, name_server = listen_for_offer()
             statistics = play_rounds(server_ip, server_port, name_team, rounds)
             statistics.summery_round_print()
 
         except KeyboardInterrupt:
-            if debug:
-                print("\nInterrupted by user. Returning to listening...\n")
-            else:
-                print("\nReturning to listening...\n")
+            print("\nInterrupted by user. Returning to listening...\n")
             continue
 
         except (socket.timeout, OSError):
@@ -345,10 +320,7 @@ def main() -> None:
             continue
 
         except Exception as e:
-            if debug:
-                print(f"Error occurred: {e}. Returning to listening...\n")
-            else:
-                print("Error occurred. Returning to listening...\n")
+            print(f"Error occurred: {e}. Returning to listening...\n")
             continue
 
 
