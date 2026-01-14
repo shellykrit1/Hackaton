@@ -1,11 +1,10 @@
 # server.py
 
-from __future__ import annotations
 import socket
 import threading
 import time
 import random
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 # import relevant functions and variables from shared_protocol file
 from shared_protocol import (
@@ -15,7 +14,7 @@ from shared_protocol import (
     request_unpack,
     server_payload_pack,
     ServerPayload,
-    client_answer_unpack,
+    client_payload_unpack,
     round_not_over,
     round_result_win,
     round_result_loss,
@@ -25,10 +24,12 @@ from shared_protocol import (
     suit_encoded_diamonds,
     suit_encoded_clubs,
     suit_encoded_spades,
+    card_to_str,
+    round_result_to_str,
+    receive_length_packet
 )
 
 address_broadcast = "<broadcast>"
-debug = True
 
 
 # networking helpers
@@ -48,24 +49,6 @@ def server_ip_local() -> str:
             socket_.close()
         except OSError:
             pass
-
-
-def check_length_packet(conn: socket.socket, length: int) -> Optional[bytes]:
-    """
-        receive exactly n bytes from a TCP socket.
-        returns None if the connection is closed or an error occurs.
-        """
-    packet_info = b""
-    while len(packet_info) < length:  # loop until packet size not smaller than "length"
-        try:
-            left_bytes = conn.recv(length - len(packet_info))  # read remaining bytes
-        except OSError:
-            return None  # return None
-        if not left_bytes:
-            return None  # return None
-        packet_info += left_bytes
-    return packet_info  # return packet_info
-
 
 # Game helpers
 class Cards:
@@ -93,6 +76,7 @@ class ServerStatistics:
     global server statistics across all clients.
     protected by a lock because multiple client threads update it.
     """
+
     def __init__(self) -> None:
         self.lock = threading.Lock()
 
@@ -165,104 +149,90 @@ def handle_client(conn: socket.socket, address: Tuple[str, int]) -> None:
     conn.settimeout(None)  # no timeout until client's response
 
     try:
-        request_bytes = check_length_packet(conn, 38)
+        request_bytes = receive_length_packet(conn, 38)
         if request_bytes is None:
             statistics.inc_before_request_disconnect()  # add disconnect before request
-            if debug:
-                print(f"Client {address} disconnected before sending Request")
+            print(f"Client {address} disconnected before sending Request")
             return
 
         request = request_unpack(request_bytes)  # unpacks request
         if request is None:
-            if debug:
-                print(f"Protocol error: invalid Request from {address}. Closing session.")  # close connection due to unvalid request
+            print(f"Protocol error: invalid Request from {address}. Closing session.")  # close connection due to unvalid request
             return
 
         # checks valid input
         number_of_rounds = int(request.number_of_rounds)
-        number_of_rounds = max(0, min(number_of_rounds, 255))
 
         name_team = (request.name_team or "").strip() or "UNKNOWN"  # creates a team name
-        if debug:
-            print(f"Client {address} connected (team='{name_team}', rounds={number_of_rounds})")
+        print(f"Client {address} connected (team='{name_team}', rounds={number_of_rounds})")
 
         for number_round in range(1, number_of_rounds + 1):  # loop number of rounds
+            print(f"\nRound {number_round}/{number_of_rounds} started for team='{name_team}'")
             deck = Cards()  # new deck each round
             player_cards = [deck.card_draw(), deck.card_draw()]
             dealer_cards = [deck.card_draw(), deck.card_draw()]
 
             try:
                 for (card_rank, card_suit) in player_cards:
-                    conn.sendall(
-                        server_payload_pack(
-                            ServerPayload(round_not_over, card_rank, card_suit)
-                        )
-                    )  # sends 2 cards to the player, game is not over yet
+                    conn.sendall(server_payload_pack(ServerPayload(round_not_over, card_rank, card_suit)))  # sends 2 cards to the player, game is not over yet
 
                 first_rank, first_suit = dealer_cards[0]  # first card
-                conn.sendall(
-                    server_payload_pack(
-                        ServerPayload(round_not_over, first_rank, first_suit)
-                    )
-                )  # sends first delare's card
+                conn.sendall(server_payload_pack(ServerPayload(round_not_over, first_rank, first_suit)))  # sends first dealer's card
 
-            except (BrokenPipeError, ConnectionResetError, OSError):
+                print(
+                    f"Initial deal: "
+                    f"player cards={card_to_str(player_cards[0][0], player_cards[0][1])},"
+                    f"{card_to_str(player_cards[1][0], player_cards[1][1])} "
+                    f"(sum cards={cards_in_hand_value(player_cards)}), "
+                    f"dealer up card={card_to_str(dealer_cards[0][0], dealer_cards[0][1])}"
+                )
+
+            except (BrokenPipeError, ConnectionResetError, OSError):  # client already close the connection/connection initialized by force/os general error
                 statistics.inc_send_failed_disconnect()  # add disconnect during initial deal
-                if debug:
-                    print(
-                        f"Client {address} disconnected abruptly during initial deal " 
-                        f"(round {number_round}/{number_of_rounds})"
-                    )
+                print(
+                    f"Client {address} disconnected abruptly during initial deal "
+                    f"(round {number_round}/{number_of_rounds})"
+                )
                 return
-
-            # if cards_in_hand_value(player_cards) > 21:  # check if client busts
-            #     try:
-            #         conn.sendall(server_payload_pack(ServerPayload(round_result_loss, 0, 0)))  # player loss
-            #     except (BrokenPipeError, ConnectionResetError, OSError):
-            #         statistics.inc_send_failed_disconnect()  # add disconnect during initial bust result
-            #         if debug:
-            #             print(
-            #                 f"Client {address} disconnected abruptly while sending initial bust result "
-            #                 f"(round {number_round}/{number_of_rounds})"
-            #             )
-            #         return
-            #     continue
 
             player_bust = False  # flag for client busts
 
             while True:  # loop until Stand or Bust
-                answer_bytes = check_length_packet(conn, 10)  # check answer length
+                answer_bytes = receive_length_packet(conn, 10)
                 if answer_bytes is None:
                     statistics.inc_during_player_disconnect()  # add disconnect during player phase
-                    if debug:
-                        print(f"Client {address} disconnected during player phase "
-                              f"(round {number_round}/{number_of_rounds})")
+                    print(f"Client {address} disconnected during player phase "
+                          f"(round {number_round}/{number_of_rounds})")
                     return
 
-                answer = client_answer_unpack(answer_bytes)
+                answer = client_payload_unpack(answer_bytes)
                 if answer is None:
-                    if debug:
-                        print(f"Protocol error: invalid decision from {address}. Closing session.")
+                    print(f"Protocol error: invalid decision from {address}. Closing session.")
                     return
 
                 if answer == "Stand":  # player ends turn
+                    print(f"Player STAND (player sum cards={cards_in_hand_value(player_cards)})")
                     break
 
                 if answer == "Hittt":  # give one more card and immediately check bust
                     new_card = deck.card_draw()
                     player_cards.append(new_card)
                     conn.sendall(server_payload_pack(ServerPayload(round_not_over, new_card[0], new_card[1])))  # sends the new card of the player
+                    print(
+                        f"Player HIT: drew={card_to_str(new_card[0], new_card[1])}, "
+                        f"player sum cards={cards_in_hand_value(player_cards)}"
+                    )
 
                     if cards_in_hand_value(player_cards) > 21:  # checks if player busts
                         conn.sendall(server_payload_pack(ServerPayload(round_result_loss, 0, 0)))  # player loss
                         player_bust = True  # turn flag and end round
+                        print("Player BUST -> round result LOSS")
                         break
 
                     continue
 
                 # any other string is a protocol violation
-                if debug:
-                    print(f"Protocol error: unexpected decision '{answer}' from {address}")
+                print(f"Protocol error: unexpected decision '{answer}' from {address}")
                 return
 
             # if player busted, skip dealer phase and continue next round
@@ -272,19 +242,26 @@ def handle_client(conn: socket.socket, address: Tuple[str, int]) -> None:
             try:
                 hidden_rank, hidden_suit = dealer_cards[1]
                 conn.sendall(server_payload_pack(ServerPayload(round_not_over, hidden_rank, hidden_suit)))  # send hidden dealer's card
+                print(
+                    f"Dealer reveals hidden card: {card_to_str(hidden_rank, hidden_suit)} "
+                    f"(dealer sum cards={cards_in_hand_value(dealer_cards)})"
+                )
 
                 while cards_in_hand_value(dealer_cards) < 17:  # loop until sum of cards is hand is less than 17
                     new_card = deck.card_draw()
                     dealer_cards.append(new_card)
                     conn.sendall(server_payload_pack(ServerPayload(round_not_over, new_card[0], new_card[1])))  # sends the new card of the dealer
+                    print(
+                        f"Dealer HIT: drew={card_to_str(new_card[0], new_card[1])}, "
+                        f"dealer sum cards={cards_in_hand_value(dealer_cards)}"
+                    )
 
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # sending during dealer phase failed, count it and exit
                 statistics.inc_during_dealer_disconnect()
                 statistics.inc_send_failed_disconnect()
-                if debug:
-                    print(f"[SERVER] Client {address} disconnected abruptly during dealer send "
-                          f"(round {number_round}/{number_of_rounds})")
+                print(f"Client {address} disconnected abruptly during dealer send "
+                      f"(round {number_round}/{number_of_rounds})")
                 return
 
             player_card_values = cards_in_hand_value(player_cards)
@@ -298,27 +275,29 @@ def handle_client(conn: socket.socket, address: Tuple[str, int]) -> None:
                 round_result = round_result_tie  # else - tie
 
             try:
+                print(
+                    f"Round {number_round} result sent: "
+                    f"player sum cards={player_card_values}, dealer sum cards={dealer_card_values}, "
+                    f"result={round_result_to_str(round_result)}"
+                )
+
                 conn.sendall(server_payload_pack(ServerPayload(round_result, 0, 0)))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 statistics.inc_send_failed_disconnect()  # add disconnect during sending final result
-                if debug:
-                    print(f"Client {address} disconnected abruptly while sending final result")
+                print(f"Client {address} disconnected abruptly while sending final result")
                 return
 
         # finished all rounds
-        if debug:
-            print(f"Client {address} finished all rounds. Closing connection.")
+        print(f"Client {address} finished all rounds. Closing connection.")
 
     except (BrokenPipeError, ConnectionResetError):
         # generic abrupt disconnect
         statistics.inc_send_failed_disconnect()
-        if debug:
-            print(f"Client {address} disconnected abruptly.")
+        print(f"Client {address} disconnected abruptly.")
 
     except Exception as e:
         # catch all exception to prevent a single client from crashing the whole server
-        if debug:
-            print(f"client={address} error={e}")
+        print(f"client={address} error={e}")
 
     finally:
         # always close the connection TCP socket
